@@ -1,27 +1,54 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
+def load_env(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')):
+    """Đọc .env (hỗ trợ 'export KEY=VALUE', dấu nháy); không ghi đè biến shell."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('export '):
+                line = line[7:].strip()
+            if '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"\''))
+
+
+load_env()
+
 CONFIG = {
-    'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
+    'openai': ('OPENAI_API_KEY', 'https://opencode.ai/inference/go/openai/v1/chat/completions'),
     'gemini': ('GEMINI_API_KEY', 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'),
     'openrouter': ('OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
     'anthropic': ('ANTHROPIC_API_KEY', 'https://api.anthropic.com/v1/messages'),
 }
 
 
-def post_json(url, headers, payload):
+def post_json(url, headers, payload, max_retries=6):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 3)
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -37,6 +64,9 @@ class Provider:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
         key_name, self.url = CONFIG[name]
+        base = os.getenv('OPENAI_BASE_URL')
+        if name == 'openai' and base:
+            self.url = base.rstrip('/') + '/chat/completions'
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
